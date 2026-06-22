@@ -1,0 +1,548 @@
+"""
+indicators/strength.py
+AlgoTrader Pro v7.0 — "The Intelligence Pipeline"
+
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from constants import (
+    ADX_WEAK_TREND,
+    ADX_MODERATE_TREND,
+    ADX_STRONG_TREND,
+    ADX_VERY_STRONG,
+    VOLUME_RATIO_WEAK,
+    VOLUME_RATIO_NORMAL,
+    VOLUME_RATIO_ELEVATED,
+    VOLUME_RATIO_STRONG,
+    VOLUME_RATIO_SPIKE,
+    VOLUME_RATIO_CLIMAX,
+    VOLUME_CLIMAX_PENALTY,
+    MFI_OVERSOLD,
+    MFI_OVERBOUGHT,
+    RSI_DIVERGENCE_THRESHOLD,
+    SCORE_NEUTRAL,
+)
+from core.models import StrengthIndicators, clamp_score
+
+log = logging.getLogger("indicators.strength")
+_ADX_WEIGHT    = 0.35
+_DI_WEIGHT     = 0.15
+_VOLUME_WEIGHT = 0.35
+_MFI_WEIGHT    = 0.15
+_VOLUME_MA_PERIOD  = 20
+_OBV_SLOPE_PERIOD  = 10
+_MFI_PERIOD = 14
+_ADX_PERIOD = 14
+_DIVERGENCE_LOOKBACK = 20
+
+def _sma(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(window=period, min_periods=period).mean()
+
+def _ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+def _wilder_smooth(series: pd.Series, period: int) -> pd.Series:
+    result = np.full(len(series), np.nan)
+    arr    = series.values.astype(float)
+    n      = len(arr)
+
+    if n < period:
+        return pd.Series(result, index=series.index)
+
+    result[period - 1] = np.nanmean(arr[:period])
+
+    for i in range(period, n):
+        if np.isnan(result[i - 1]) or np.isnan(arr[i]):
+            result[i] = result[i - 1] if not np.isnan(result[i - 1]) else np.nan
+        else:
+            result[i] = (result[i - 1] * (period - 1) + arr[i]) / period
+
+    return pd.Series(result, index=series.index)
+
+def _calc_true_range(df: pd.DataFrame) -> pd.Series:
+    high  = df["high"]
+    low   = df["low"]
+    close = df["close"]
+
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    tr.iloc[0] = high.iloc[0] - low.iloc[0]
+    return tr
+
+def _calc_directional_movement(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    high = df["high"].values
+    low  = df["low"].values
+    n    = len(high)
+
+    plus_dm  = np.zeros(n)
+    minus_dm = np.zeros(n)
+
+    for i in range(1, n):
+        up_move   = high[i] - high[i - 1]
+        down_move = low[i - 1] - low[i]
+
+        if up_move > down_move and up_move > 0.0:
+            plus_dm[i] = up_move
+        if down_move > up_move and down_move > 0.0:
+            minus_dm[i] = down_move
+
+    return (
+        pd.Series(plus_dm,  index=df.index),
+        pd.Series(minus_dm, index=df.index),
+    )
+
+def _score_adx(adx_val: float) -> float:
+    if adx_val < ADX_WEAK_TREND:
+        t    = adx_val / ADX_WEAK_TREND
+        return clamp_score(t * 35.0)
+
+    if adx_val < ADX_MODERATE_TREND:
+        t    = (adx_val - ADX_WEAK_TREND) / (ADX_MODERATE_TREND - ADX_WEAK_TREND)
+        return clamp_score(35.0 + t * 20.0)
+
+    if adx_val < ADX_STRONG_TREND:
+        t    = (adx_val - ADX_MODERATE_TREND) / (ADX_STRONG_TREND - ADX_MODERATE_TREND)
+        return clamp_score(55.0 + t * 25.0)
+
+    if adx_val < ADX_VERY_STRONG:
+        t    = (adx_val - ADX_STRONG_TREND) / (ADX_VERY_STRONG - ADX_STRONG_TREND)
+        return clamp_score(80.0 - t * 10.0)
+
+    excess = min(adx_val - ADX_VERY_STRONG, 30.0)
+    return clamp_score(70.0 - excess * 0.8)
+
+def _score_di(plus_di: float, minus_di: float) -> float:
+    total = plus_di + minus_di
+    if total < 1e-9:
+        return SCORE_NEUTRAL
+    ratio = plus_di / total
+    return clamp_score(5.0 + ratio * 90.0)
+
+def calculate_adx(
+    df: pd.DataFrame,
+    period: int = _ADX_PERIOD,
+    errors: Optional[List[str]] = None,
+) -> StrengthIndicators:
+    if errors is None:
+        errors = []
+
+    for col in ("high", "low", "close"):
+        if col not in df.columns:
+            errors.append(f"adx: kolom '{col}' tidak tersedia")
+            return StrengthIndicators(
+                adx=None,
+                plus_di=None,
+                minus_di=None,
+                adx_score=SCORE_NEUTRAL,
+                di_score=SCORE_NEUTRAL,
+                composite_score=SCORE_NEUTRAL,
+            )
+
+    min_bars = period * 2 + 1
+    if len(df) < min_bars:
+        errors.append(
+            f"adx: data hanya {len(df)} bar, butuh minimal {min_bars}"
+        )
+        return StrengthIndicators(
+            adx=None,
+            plus_di=None,
+            minus_di=None,
+            adx_score=SCORE_NEUTRAL,
+            di_score=SCORE_NEUTRAL,
+            composite_score=SCORE_NEUTRAL,
+        )
+
+    tr       = _calc_true_range(df)
+    plus_dm, minus_dm = _calc_directional_movement(df)
+    atr_smooth       = _wilder_smooth(tr,       period)
+    smooth_plus_dm   = _wilder_smooth(plus_dm,  period)
+    smooth_minus_dm  = _wilder_smooth(minus_dm, period)
+    atr_safe = atr_smooth.replace(0.0, np.nan)
+    di_plus  = (smooth_plus_dm  / atr_safe * 100.0).fillna(0.0)
+    di_minus = (smooth_minus_dm / atr_safe * 100.0).fillna(0.0)
+    di_sum  = (di_plus + di_minus).replace(0.0, np.nan)
+    dx      = ((di_plus - di_minus).abs() / di_sum * 100.0).fillna(0.0)
+    adx_series = _wilder_smooth(dx, period)
+    last_adx      = adx_series.dropna()
+    last_di_plus  = di_plus.dropna()
+    last_di_minus = di_minus.dropna()
+
+    if last_adx.empty or last_di_plus.empty:
+        errors.append("adx: hasil kalkulasi kosong setelah dropna")
+        return StrengthIndicators(
+            adx=None,
+            plus_di=None,
+            minus_di=None,
+            adx_score=SCORE_NEUTRAL,
+            di_score=SCORE_NEUTRAL,
+            composite_score=SCORE_NEUTRAL,
+        )
+
+    adx_val      = float(last_adx.iloc[-1])
+    plus_di_val  = float(last_di_plus.iloc[-1])
+    minus_di_val = float(last_di_minus.iloc[-1])
+
+    adx_score = _score_adx(adx_val)
+    di_score  = _score_di(plus_di_val, minus_di_val)
+
+    log.debug(
+        "adx: adx=%.1f DI+=%.1f DI-=%.1f → adx_score=%.1f di_score=%.1f",
+        adx_val, plus_di_val, minus_di_val, adx_score, di_score,
+    )
+
+    return StrengthIndicators(
+        adx=adx_val,
+        plus_di=plus_di_val,
+        minus_di=minus_di_val,
+        adx_score=adx_score,
+        di_score=di_score,
+        composite_score=clamp_score((adx_score + di_score) / 2),
+    )
+
+def _calc_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    c   = close.values.astype(float)
+    v   = volume.values.astype(float)
+    n   = len(c)
+    obv = np.zeros(n)
+
+    for i in range(1, n):
+        if c[i] > c[i - 1]:
+            obv[i] = obv[i - 1] + v[i]
+        elif c[i] < c[i - 1]:
+            obv[i] = obv[i - 1] - v[i]
+        else:
+            obv[i] = obv[i - 1]
+
+    return pd.Series(obv, index=close.index)
+
+def _obv_trend(obv: pd.Series, window: int = _OBV_SLOPE_PERIOD) -> str:
+    if len(obv) < window + 1:
+        return "flat"
+
+    current = float(obv.iloc[-1])
+    past    = float(obv.iloc[-window])
+    delta   = current - past
+
+    mean_abs = float(obv.iloc[-window:].abs().mean())
+    threshold = mean_abs * 0.01 if mean_abs > 0 else 1.0
+
+    if delta > threshold:
+        return "rising"
+    if delta < -threshold:
+        return "falling"
+    return "flat"
+
+def _score_volume(
+    ratio: float,
+    spike: bool,
+    climax: bool,
+    obv_trend_str: str,
+) -> float:
+    if ratio < VOLUME_RATIO_WEAK:
+        t    = ratio / VOLUME_RATIO_WEAK
+        base = t * 20.0
+    elif ratio < VOLUME_RATIO_NORMAL:
+        t    = (ratio - VOLUME_RATIO_WEAK) / (VOLUME_RATIO_NORMAL - VOLUME_RATIO_WEAK)
+        base = 20.0 + t * 20.0
+    elif ratio < VOLUME_RATIO_ELEVATED:
+        t    = (ratio - VOLUME_RATIO_NORMAL) / (VOLUME_RATIO_ELEVATED - VOLUME_RATIO_NORMAL)
+        base = 40.0 + t * 20.0
+    elif ratio < VOLUME_RATIO_STRONG:
+        t    = (ratio - VOLUME_RATIO_ELEVATED) / (VOLUME_RATIO_STRONG - VOLUME_RATIO_ELEVATED)
+        base = 60.0 + t * 15.0
+    elif ratio < VOLUME_RATIO_SPIKE:
+        t    = (ratio - VOLUME_RATIO_STRONG) / (VOLUME_RATIO_SPIKE - VOLUME_RATIO_STRONG)
+        base = 75.0 + t * 7.0
+    else:
+        excess = min(ratio - VOLUME_RATIO_SPIKE, VOLUME_RATIO_CLIMAX - VOLUME_RATIO_SPIKE)
+        t      = excess / (VOLUME_RATIO_CLIMAX - VOLUME_RATIO_SPIKE)
+        base   = 82.0 - t * 12.0
+
+    score = base
+
+    if obv_trend_str == "rising":
+        score += 8.0
+    elif obv_trend_str == "falling":
+        score -= 8.0
+
+    if climax:
+        score -= VOLUME_CLIMAX_PENALTY
+
+    return clamp_score(score)
+
+def calculate_volume_analysis(
+    df: pd.DataFrame,
+    volume_ma_period: int = _VOLUME_MA_PERIOD,
+    errors: Optional[List[str]] = None,
+) -> StrengthIndicators:
+    if errors is None:
+        errors = []
+
+    for col in ("close", "volume"):
+        if col not in df.columns:
+            errors.append(f"volume: kolom '{col}' tidak tersedia")
+            return StrengthIndicators(
+                volume_ratio=None,
+                volume_spike=False,
+                obv=None,
+                obv_trend="flat",
+                volume_climax=False,
+                volume_score=SCORE_NEUTRAL,
+                composite_score=SCORE_NEUTRAL,
+            )
+
+    vol_col = "quote_volume" if "quote_volume" in df.columns else "volume"
+    volume  = df[vol_col].replace(0.0, np.nan)
+    close   = df["close"]
+
+    min_bars = volume_ma_period + 2
+    if len(df) < min_bars:
+        errors.append(
+            f"volume: data hanya {len(df)} bar, butuh minimal {min_bars}"
+        )
+        return StrengthIndicators(
+            volume_ratio=None,
+            volume_spike=False,
+            obv=None,
+            obv_trend="flat",
+            volume_climax=False,
+            volume_score=SCORE_NEUTRAL,
+            composite_score=SCORE_NEUTRAL,
+        )
+
+    vol_ma     = _sma(volume, volume_ma_period)
+    last_vol   = float(volume.iloc[-1]) if not np.isnan(volume.iloc[-1]) else 0.0
+    last_ma    = float(vol_ma.iloc[-1]) if pd.notna(vol_ma.iloc[-1]) else 0.0
+
+    if last_ma < 1e-9:
+        errors.append("volume: MA volume mendekati nol — tidak bisa hitung ratio")
+        return StrengthIndicators(
+            volume_ratio=None,
+            volume_spike=False,
+            obv=None,
+            obv_trend="flat",
+            volume_climax=False,
+            volume_score=SCORE_NEUTRAL,
+            composite_score=SCORE_NEUTRAL,
+        )
+
+    ratio  = last_vol / last_ma
+    spike  = ratio >= VOLUME_RATIO_SPIKE
+    climax = ratio >= VOLUME_RATIO_CLIMAX
+    raw_volume = df["volume"].replace(0.0, 0.0)
+    obv_series  = _calc_obv(close, raw_volume)
+    obv_val     = float(obv_series.iloc[-1])
+    obv_trend_str = _obv_trend(obv_series)
+    score = _score_volume(ratio, spike, climax, obv_trend_str)
+
+    log.debug(
+        "volume: ratio=%.2fx spike=%s climax=%s obv_trend=%s → score=%.1f",
+        ratio, spike, climax, obv_trend_str, score,
+    )
+
+    return StrengthIndicators(
+        volume_ratio=float(ratio),
+        volume_spike=bool(spike),
+        obv=obv_val,
+        obv_trend=obv_trend_str,
+        volume_climax=bool(climax),
+        volume_score=score,
+        composite_score=score,
+    )
+
+def _calc_mfi(df: pd.DataFrame, period: int) -> pd.Series:
+    high   = df["high"]
+    low    = df["low"]
+    close  = df["close"]
+    volume = df["volume"].replace(0.0, 0.0)
+    typical_price = (high + low + close) / 3.0
+    raw_mf        = typical_price * volume
+    tp_change    = typical_price.diff()
+    positive_mf  = raw_mf.where(tp_change > 0, 0.0)
+    negative_mf  = raw_mf.where(tp_change < 0, 0.0).abs()
+    sum_pos  = positive_mf.rolling(window=period, min_periods=period).sum()
+    sum_neg  = negative_mf.rolling(window=period, min_periods=period).sum()
+    money_ratio = (sum_pos / sum_neg.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    mfi         = 100.0 - (100.0 / (1.0 + money_ratio))
+
+    return mfi.fillna(SCORE_NEUTRAL)
+
+def _detect_mfi_rsi_divergence(
+    mfi: pd.Series,
+    rsi: pd.Series,
+    lookback: int = 10,
+) -> float:
+    if len(mfi) < lookback + 1 or len(rsi) < lookback + 1:
+        return 0.0
+
+    mfi_change = float(mfi.iloc[-1]) - float(mfi.iloc[-lookback])
+    rsi_change = float(rsi.iloc[-1]) - float(rsi.iloc[-lookback])
+
+    diff = mfi_change - rsi_change
+
+    if abs(diff) < RSI_DIVERGENCE_THRESHOLD:
+        return 0.0
+
+    return diff
+
+def _score_mfi(mfi_val: float, mfi_rsi_div: float) -> float:
+    if mfi_val <= MFI_OVERSOLD:
+        if mfi_val <= 20.0:
+            base = 50.0
+        else:
+            t    = (mfi_val - 20.0) / (MFI_OVERSOLD - 20.0)
+            base = 50.0 + t * 8.0
+    elif mfi_val <= 45.0:
+        t    = (mfi_val - MFI_OVERSOLD) / (45.0 - MFI_OVERSOLD)
+        base = 58.0 - t * 6.0
+    elif mfi_val <= 55.0:
+        t    = (mfi_val - 45.0) / 10.0
+        base = 52.0 + t * 20.0
+    elif mfi_val <= MFI_OVERBOUGHT:
+        t    = (mfi_val - 55.0) / (MFI_OVERBOUGHT - 55.0)
+        base = 72.0 - t * 34.0
+    elif mfi_val <= 90.0:
+        t    = (mfi_val - MFI_OVERBOUGHT) / 10.0
+        base = 38.0 - t * 16.0
+    else:
+        base = 22.0
+
+    score = base
+
+    if mfi_rsi_div > RSI_DIVERGENCE_THRESHOLD:
+        score += min(10.0, mfi_rsi_div * 0.3)
+    elif mfi_rsi_div < -RSI_DIVERGENCE_THRESHOLD:
+        score += max(-8.0, mfi_rsi_div * 0.2)
+
+    return clamp_score(score)
+
+def calculate_money_flow(
+    df: pd.DataFrame,
+    period: int = _MFI_PERIOD,
+    errors: Optional[List[str]] = None,
+) -> StrengthIndicators:
+    if errors is None:
+        errors = []
+
+    for col in ("high", "low", "close", "volume"):
+        if col not in df.columns:
+            errors.append(f"mfi: kolom '{col}' tidak tersedia")
+            return StrengthIndicators(
+                mfi=None,
+                mfi_divergence=0.0,
+                mfi_score=SCORE_NEUTRAL,
+                composite_score=SCORE_NEUTRAL,
+            )
+
+    min_bars = period + 3
+    if len(df) < min_bars:
+        errors.append(
+            f"mfi: data hanya {len(df)} bar, butuh minimal {min_bars}"
+        )
+        return StrengthIndicators(
+            mfi=None,
+            mfi_divergence=0.0,
+            mfi_score=SCORE_NEUTRAL,
+            composite_score=SCORE_NEUTRAL,
+        )
+
+    from indicators.momentum import _calc_rsi
+    mfi_series = _calc_mfi(df, period)
+    mfi_val    = float(mfi_series.iloc[-1])
+    rsi_series = _calc_rsi(df["close"], period)
+    mfi_div = _detect_mfi_rsi_divergence(mfi_series, rsi_series)
+    score = _score_mfi(mfi_val, mfi_div)
+
+    log.debug(
+        "mfi: val=%.1f div=%.2f → score=%.1f",
+        mfi_val, mfi_div, score,
+    )
+
+    return StrengthIndicators(
+        mfi=mfi_val,
+        mfi_divergence=mfi_div,
+        mfi_score=score,
+        composite_score=score,
+    )
+
+def score_strength(
+    df: pd.DataFrame,
+    errors: Optional[List[str]] = None,
+) -> StrengthIndicators:
+    if errors is None:
+        errors = []
+
+    result = StrengthIndicators()
+
+    adx_res = calculate_adx(df, errors=errors)
+    result.adx       = adx_res.adx
+    result.plus_di   = adx_res.plus_di
+    result.minus_di  = adx_res.minus_di
+    result.adx_score = adx_res.adx_score
+    result.di_score  = adx_res.di_score
+    adx_ok = result.adx is not None
+    di_ok  = result.plus_di is not None
+
+    vol_res = calculate_volume_analysis(df, errors=errors)
+    result.volume_ratio  = vol_res.volume_ratio
+    result.volume_spike  = vol_res.volume_spike
+    result.obv           = vol_res.obv
+    result.obv_trend     = vol_res.obv_trend
+    result.volume_climax = vol_res.volume_climax
+    result.volume_score  = vol_res.volume_score
+    vol_ok = result.volume_ratio is not None
+
+    mfi_res = calculate_money_flow(df, errors=errors)
+    result.mfi           = mfi_res.mfi
+    result.mfi_divergence = mfi_res.mfi_divergence
+    result.mfi_score     = mfi_res.mfi_score
+    mfi_ok = result.mfi is not None
+
+    sub_indicators = [
+        (_ADX_WEIGHT,    adx_ok, result.adx_score),
+        (_DI_WEIGHT,     di_ok,  result.di_score),
+        (_VOLUME_WEIGHT, vol_ok, result.volume_score),
+        (_MFI_WEIGHT,    mfi_ok, result.mfi_score),
+    ]
+
+    total_weight_available = sum(w for w, ok, _ in sub_indicators if ok)
+
+    if total_weight_available < 1e-6:
+        errors.append("strength: tidak ada sub-indikator yang valid, composite = neutral")
+        result.composite_score = SCORE_NEUTRAL
+        return result
+
+    composite = 0.0
+    for base_w, ok, score in sub_indicators:
+        if not ok:
+            continue
+        adjusted_w  = base_w / total_weight_available
+        composite  += score * adjusted_w
+
+    result.composite_score = clamp_score(composite)
+
+    log.debug(
+        "strength composite: adx=%.1f di=%.1f vol=%.1f mfi=%.1f → composite=%.1f",
+        result.adx_score, result.di_score, result.volume_score, result.mfi_score, result.composite_score,
+    )
+
+    return result
+
+def calculate_all(
+    df: pd.DataFrame,
+    errors: Optional[List[str]] = None,
+) -> StrengthIndicators:
+    return score_strength(df, errors=errors)

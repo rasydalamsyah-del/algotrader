@@ -1,0 +1,14 @@
+.env
+.env.*
+__pycache__/
+*.pyc
+*.pyo
+logs/
+*.log
+data/*.db
+.tg_pid
+.bot_pid
+.tg_offset
+*.bak
+venv/
+.venv/
